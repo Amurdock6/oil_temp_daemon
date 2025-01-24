@@ -2,114 +2,152 @@
 #include <fstream>
 #include <unistd.h>
 #include <fcntl.h>
+#include <csignal>
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>
 #include <thread>
 #include <chrono>
-#include <vector>
 #include <cmath>
+#include <vector>
 
-// ADS1115 I2C address (0x48 by default)
+// ADS1115 I2C address
 #define ADS1115_ADDRESS 0x48
 
-// ADS1115 Register Addresses
-#define REG_POINTER 0x00
+// Registers
 #define REG_CONVERSION 0x00
-#define REG_CONFIG 0x01
+#define REG_CONFIG     0x01
 
-// Function to initialize I2C communication
+static bool g_shouldStop = false;
+
+// Signal handler to cleanly exit
+void handle_signal(int signal) {
+    std::cerr << "[daemon] Caught signal " << signal << ", stopping...\n";
+    g_shouldStop = true;
+}
+
+// ---------------------------------------------------------
+// 1) Open I2C and configure ADS1115
+// ---------------------------------------------------------
 int initialize_i2c(const char* device, int address) {
-    int file;
-    if ((file = open(device, O_RDWR)) < 0) {
-        std::cerr << "Failed to open the I2C bus\n";
+    int file = open(device, O_RDWR);
+    if (file < 0) {
+        std::cerr << "[daemon] Failed to open I2C bus: " << device << "\n";
         return -1;
     }
     if (ioctl(file, I2C_SLAVE, address) < 0) {
-        std::cerr << "Failed to acquire bus access and/or talk to slave\n";
+        std::cerr << "[daemon] Failed to talk to slave at 0x"
+                  << std::hex << address << "\n";
         close(file);
         return -1;
     }
     return file;
 }
 
-// Function to configure ADS1115
-bool configure_ads1115(int file) {
-    // Configuration for single-ended input on A0, continuous conversion, 4.096V FSR, 128 SPS
-    // Data sheet reference: https://www.ti.com/lit/ds/symlink/ads1115.pdf
+bool configure_ads1115(int fd) {
+    // Example config: AIN0 single-ended, +/-4.096V, continuous mode, 128 SPS
     uint8_t config[3];
     config[0] = REG_CONFIG;
-    config[1] = 0xC3; // 11000011: OS=1 (start single conversion), MUX=100 (AIN0 single-ended), PGA=001 (-4.096V to +4.096V), MODE=1 (continuous)
-    config[2] = 0x83; // DR=100 (128 SPS), COMP_MODE=1, COMP_POL=1, COMP_LAT=0, COMP_QUE=11 (disabled)
+    // High byte
+    config[1] = 0xC3; 
+    // Low byte
+    config[2] = 0x83; 
 
-    if (write(file, config, 3) != 3) {
-        std::cerr << "Failed to write configuration to ADS1115\n";
+    if (write(fd, config, 3) != 3) {
+        std::cerr << "[daemon] Failed to write ADS1115 config\n";
         return false;
     }
     return true;
 }
 
-// Function to read ADC value
-int16_t read_ads1115(int file) {
+// ---------------------------------------------------------
+// 2) Read ADS1115 raw ADC
+// ---------------------------------------------------------
+int16_t read_ads1115(int fd) {
     uint8_t reg = REG_CONVERSION;
-    if (write(file, &reg, 1) != 1) {
-        std::cerr << "Failed to write to ADS1115 conversion register\n";
+    if (write(fd, &reg, 1) != 1) {
+        std::cerr << "[daemon] Failed to set ADS1115 pointer\n";
         return 0;
     }
-
-    // ADS1115 continuous conversion mode updates the conversion register automatically
     uint8_t data[2];
-    if (read(file, data, 2) != 2) {
-        std::cerr << "Failed to read conversion data\n";
+    if (read(fd, data, 2) != 2) {
+        std::cerr << "[daemon] Failed to read ADS1115 conversion data\n";
         return 0;
     }
-
-    // Convert the two bytes to a single 16-bit value
     int16_t raw = (data[0] << 8) | data[1];
     return raw;
 }
 
-// Function to convert raw ADC value to voltage
-double adc_to_voltage(int16_t adc_val) {
-    // ADS1115 is a 16-bit ADC, with a range of +/-4.096V (configured)
-    // Calculate voltage based on ADS1115 configuration
-    // Formula: Voltage = (ADC_VALUE * FSR) / 32768
-    double voltage = (adc_val * 4.096) / 32768.0;
-    return voltage;
+// ---------------------------------------------------------
+// 3) Convert raw ADC -> voltage
+//    with +/- 4.096 V range => 32768 counts = 4.096 V
+// ---------------------------------------------------------
+double adc_to_voltage(int16_t raw) {
+    return (static_cast<double>(raw) * 4.096) / 32768.0;
 }
 
-// Function to calculate sensor resistance from voltage divider
-double calculate_resistance(double voltage, double R_fixed) {
-    // Voltage divider formula: V_out = V_in * (R_sensor / (R_sensor + R_fixed))
-    // Rearranged: R_sensor = (V_out * R_fixed) / (V_in - V_out)
-    double R_sensor = (voltage * R_fixed) / (3.3 - voltage);
-    return R_sensor;
+// ---------------------------------------------------------
+// 4) Compute sensor resistance from measured voltage
+//    R_sensor = R_pullup * (V_meas / (V_supply - V_meas))
+// ---------------------------------------------------------
+double compute_sensor_resistance(double voltage, double r_pullup, double v_supply) {
+    // If voltage is near supply, or negative, handle edge cases:
+    if (voltage >= (v_supply - 0.01)) {
+        return INFINITY;
+    } else if (voltage < 0.0) {
+        return 0.0;
+    }
+    return r_pullup * (voltage / (v_supply - voltage));
 }
 
-// Function to map resistance to temperature (Fahrenheit)
-// Replace this with your actual resistance-temperature table
-double resistance_to_temperature(double R_sensor) {
-    // Example linear approximation based on sensor specs
-    // VDO 323-057: 322 Ω at 120°F and 18.6 Ω at 300°F
-    // Assuming linearity between these points (for simplicity)
-    double temp;
-    if (R_sensor >= 322.0) {
-        temp = 120.0;
+// ---------------------------------------------------------
+// 5) Table-based interpolation: (temp_F, ohms).
+// ---------------------------------------------------------
+static const std::vector<std::pair<double,double>> vdo_table = {
+    {130, 360.0}, {132, 341.9}, {149, 258.0}, {158, 219.4},
+    {159.7, 200.0}, {161, 185.8}, {171, 164.5}, {179.5, 140.6},
+    {180, 139.1}, {187, 123.3}, {190, 117.8}, {197, 102.2},
+    {200, 100.9}, {209, 87.9}, {210, 86.3}
+};
+
+// ---------------------------------------------------------
+// 6) Interpolate R -> temp 
+// ---------------------------------------------------------
+double resistance_to_temp_f(double R, const std::vector<std::pair<double,double>>& table) {
+    // table[i] = (tempF, ohms), in ascending temperature order
+    // If R is larger than the ohms at the coldest entry => below the min temp
+    if (R > table.front().second) {
+        return NAN; // "colder than table"
     }
-    else if (R_sensor <= 18.6) {
-        temp = 300.0;
+    // If R is smaller than the ohms at the hottest entry => above the max temp
+    if (R < table.back().second) {
+        return NAN; // "hotter than table"
     }
-    else {
-        // Linear interpolation
-        temp = ((R_sensor - 322.0) / (18.6 - 322.0)) * (300.0 - 120.0) + 120.0;
+
+    // Search the table segments
+    for (size_t i = 0; i < table.size() - 1; ++i) {
+        double t1 = table[i].first;
+        double r1 = table[i].second;
+        double t2 = table[i+1].first;
+        double r2 = table[i+1].second;
+
+        // Check if R is between r1 and r2. 
+        // Note that r1 > r2 because sensor R goes down as temp goes up.
+        if (r1 >= R && R >= r2) {
+            double fraction = (R - r1) / (r2 - r1);
+            return t1 + fraction * (t2 - t1);
+        }
     }
-    return temp;
+    // If we didn’t find it, R is out of table range
+    return NAN;
 }
 
-// Function to write temperature to file
+// ---------------------------------------------------------
+// 7) Write temperature to file
+// ---------------------------------------------------------
 bool write_temperature(const std::string& filepath, double temperature) {
     std::ofstream outfile(filepath, std::ios::out | std::ios::trunc);
     if (!outfile.is_open()) {
-        std::cerr << "Failed to open file for writing: " << filepath << "\n";
+        std::cerr << "[daemon] Could not open file: " << filepath << "\n";
         return false;
     }
     outfile << temperature;
@@ -117,38 +155,61 @@ bool write_temperature(const std::string& filepath, double temperature) {
     return true;
 }
 
-int main() {
+// ---------------------------------------------------------
+// 8) Main daemon entry
+// ---------------------------------------------------------
+int main(int argc, char* argv[]) {
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    // 8a) Open and configure ADS1115
     const char* i2c_device = "/dev/i2c-1";
-    int ads1115_address = ADS1115_ADDRESS;
-    int i2c_file = initialize_i2c(i2c_device, ads1115_address);
-    if (i2c_file < 0) {
+    int fd = initialize_i2c(i2c_device, ADS1115_ADDRESS);
+    if (fd < 0) {
+        return 1;
+    }
+    if (!configure_ads1115(fd)) {
+        close(fd);
         return 1;
     }
 
-    if (!configure_ads1115(i2c_file)) {
-        close(i2c_file);
-        return 1;
-    }
+    // 8b) Setup constants
+    const double R_PULLUP = 330.0; // ohms
+    const double V_SUPPLY = 3.3;   // volts
 
-    const double R_fixed = 100.0; // 100-ohm resistor
+    // 8c) Output path for the temperature
     const std::string output_file = "/data/local/tmp/oil_temp";
 
-    while (true) {
-        int16_t adc_val = read_ads1115(i2c_file);
-        double voltage = adc_to_voltage(adc_val);
-        double R_sensor = calculate_resistance(voltage, R_fixed);
-        double temperature = resistance_to_temperature(R_sensor);
+    // 8d) Main loop
+    while (!g_shouldStop) {
+        // Read ADC, convert to voltage
+        int16_t raw_adc = read_ads1115(fd);
+        double voltage = adc_to_voltage(raw_adc);
 
-        if (!write_temperature(output_file, temperature)) {
-            std::cerr << "Error writing temperature to file\n";
-        }
-        else {
-            std::cout << "Temperature: " << temperature << "°F\n";
+        // Compute sensor R, then temperature
+        double R_sensor = compute_sensor_resistance(voltage, R_PULLUP, V_SUPPLY);
+        double temp_f   = resistance_to_temp_f(R_sensor, vdo_table);
+
+        // Print/log
+        if (std::isnan(temp_f)) {
+            std::cout << "[daemon] Voltage=" << voltage
+                      << "  R=" << R_sensor 
+                      << " => out of range!\n";
+        } else {
+            std::cout << "[daemon] Voltage=" << voltage 
+                      << "  R=" << R_sensor 
+                      << " => " << temp_f << " °F\n";
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // 500ms delay
+        // Write to file
+        if (!write_temperature(output_file, temp_f)) {
+            std::cerr << "[daemon] Error writing temperature\n";
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    close(i2c_file);
+    close(fd);
+    std::cout << "[daemon] Exiting cleanly.\n";
     return 0;
 }
