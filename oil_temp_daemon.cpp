@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <vector>
+#include <limits>
 
 // ADS1115 I2C address
 #define ADS1115_ADDRESS 0x48
@@ -26,7 +27,7 @@ void handle_signal(int signal) {
 }
 
 // ---------------------------------------------------------
-// 1) Open I2C and configure ADS1115
+// 1) Open I2C bus and set up communication
 // ---------------------------------------------------------
 int initialize_i2c(const char* device, int address) {
     int file = open(device, O_RDWR);
@@ -34,6 +35,7 @@ int initialize_i2c(const char* device, int address) {
         std::cerr << "[daemon] Failed to open I2C bus: " << device << "\n";
         return -1;
     }
+
     if (ioctl(file, I2C_SLAVE, address) < 0) {
         std::cerr << "[daemon] Failed to talk to slave at 0x"
                   << std::hex << address << "\n";
@@ -43,14 +45,17 @@ int initialize_i2c(const char* device, int address) {
     return file;
 }
 
+// ---------------------------------------------------------
+// 2) Configure ADS1115 (continuous mode, single-ended on A1, ±4.096V, 128SPS)
+// ---------------------------------------------------------
 bool configure_ads1115(int fd) {
     // Example config: AIN0 single-ended, +/-4.096V, continuous mode, 128 SPS
+    //   High byte: 1100 0011 = 0xC3
+    //   Low byte:  1000 0011 = 0x83
     uint8_t config[3];
     config[0] = REG_CONFIG;
-    // High byte
-    config[1] = 0xC3; 
-    // Low byte
-    config[2] = 0x83; 
+    config[1] = 0xC3;
+    config[2] = 0x83;
 
     if (write(fd, config, 3) != 3) {
         std::cerr << "[daemon] Failed to write ADS1115 config\n";
@@ -60,7 +65,7 @@ bool configure_ads1115(int fd) {
 }
 
 // ---------------------------------------------------------
-// 2) Read ADS1115 raw ADC
+// 3) Read ADS1115 raw 16-bit ADC value
 // ---------------------------------------------------------
 int16_t read_ads1115(int fd) {
     uint8_t reg = REG_CONVERSION;
@@ -78,21 +83,24 @@ int16_t read_ads1115(int fd) {
 }
 
 // ---------------------------------------------------------
-// 3) Convert raw ADC -> voltage
-//    with +/- 4.096 V range => 32768 counts = 4.096 V
+// 4) Convert raw ADC -> voltage
+//    With ±4.096 V range => 32768 counts = 4.096 V
 // ---------------------------------------------------------
 double adc_to_voltage(int16_t raw) {
     return (static_cast<double>(raw) * 4.096) / 32768.0;
 }
 
 // ---------------------------------------------------------
-// 4) Compute sensor resistance from measured voltage
+// 5) Compute sensor resistance from measured voltage
 //    R_sensor = R_pullup * (V_meas / (V_supply - V_meas))
+//
+//    Returns 0.0 if voltage < 0
+//    Returns INFINITY if V_meas ~ V_supply
 // ---------------------------------------------------------
 double compute_sensor_resistance(double voltage, double r_pullup, double v_supply) {
-    // If voltage is near supply, or negative, handle edge cases:
+    // If voltage is near supply, or negative, handle edge cases
     if (voltage >= (v_supply - 0.01)) {
-        return INFINITY;
+        return std::numeric_limits<double>::infinity();
     } else if (voltage < 0.0) {
         return 0.0;
     }
@@ -100,54 +108,67 @@ double compute_sensor_resistance(double voltage, double r_pullup, double v_suppl
 }
 
 // ---------------------------------------------------------
-// 5) Table-based interpolation: (temp_F, ohms).
+// 6) VDO table (temp_F, ohms). 
+//    Sensor R decreases as temperature increases.
 // ---------------------------------------------------------
 static const std::vector<std::pair<double,double>> vdo_table = {
     {130, 360.0}, {132, 341.9}, {149, 258.0}, {158, 219.4},
     {159.7, 200.0}, {161, 185.8}, {171, 164.5}, {179.5, 140.6},
-    {180, 139.1}, {187, 123.3}, {190, 117.8}, {197, 102.2},
-    {200, 100.9}, {209, 87.9}, {210, 86.3}
+    {180, 139.1},  {187, 123.3}, {190, 117.8}, {197, 102.2},
+    {200, 100.9},  {209, 87.9},  {210, 86.3}
 };
 
 // ---------------------------------------------------------
-// 6) Interpolate R -> temp 
+// 7) Interpolate R -> Temp (°F) using the VDO table
+//
+//    If R > 360 => below min temp (we return a sentinel, e.g. 100.0 or 0.0)
+//    If R < 86.3 => above max temp (e.g. 250 or 300.0)
+//    Otherwise do piecewise linear interpolation
+//
+//    Return NaN if something is off, though we'll try to avoid that with
+//    sentinel logic for extremes.
 // ---------------------------------------------------------
-double resistance_to_temp_f(double R, const std::vector<std::pair<double,double>>& table) {
-    // table[i] = (tempF, ohms), in ascending temperature order
-    // If R is larger than the ohms at the coldest entry => below the min temp
-    if (R > table.front().second) {
-        return NAN; // "colder than table"
-    }
-    // If R is smaller than the ohms at the hottest entry => above the max temp
-    if (R < table.back().second) {
-        return NAN; // "hotter than table"
+double resistance_to_temp_f(double R) {
+    // Largest ohms (lowest temp) is table.front().second = 360 ohms => ~130°F
+    // Smallest ohms (highest temp) is table.back().second = 86.3 ohms => ~210°F
+
+    // If R is bigger than the coldest ohms => "colder than table"
+    if (R > vdo_table.front().second) {
+        // Could return something like 100°F or 0°F 
+        // to indicate "too cold / out of range"
+        return std::numeric_limits<double>::quiet_NaN();
     }
 
-    // Search the table segments
-    for (size_t i = 0; i < table.size() - 1; ++i) {
-        double t1 = table[i].first;
-        double r1 = table[i].second;
-        double t2 = table[i+1].first;
-        double r2 = table[i+1].second;
+    // If R is smaller than the hottest ohms => "hotter than table"
+    if (R < vdo_table.back().second) {
+        // Could return something like 250°F or 300°F
+        return std::numeric_limits<double>::quiet_NaN();
+    }
 
-        // Check if R is between r1 and r2. 
-        // Note that r1 > r2 because sensor R goes down as temp goes up.
+    // Now do piecewise interpolation across the table
+    for (size_t i = 0; i < vdo_table.size() - 1; ++i) {
+        double t1 = vdo_table[i].first;
+        double r1 = vdo_table[i].second;
+        double t2 = vdo_table[i+1].first;
+        double r2 = vdo_table[i+1].second;
+
+        // r1 >= R >= r2
         if (r1 >= R && R >= r2) {
-            double fraction = (R - r1) / (r2 - r1);
+            double fraction = (R - r1) / (r2 - r1);  // between 0 and 1
             return t1 + fraction * (t2 - t1);
         }
     }
-    // If we didn’t find it, R is out of table range
-    return NAN;
+    // If we somehow fall through, return NaN
+    return std::numeric_limits<double>::quiet_NaN();
 }
 
 // ---------------------------------------------------------
-// 7) Write temperature to file
+// 8) Write temperature to file
 // ---------------------------------------------------------
 bool write_temperature(const std::string& filepath, double temperature) {
     std::ofstream outfile(filepath, std::ios::out | std::ios::trunc);
     if (!outfile.is_open()) {
-        std::cerr << "[daemon] Could not open file: " << filepath << "\n";
+        std::cerr << "[daemon] Could not open file for writing: " << filepath << "\n";
         return false;
     }
     outfile << temperature;
@@ -156,16 +177,18 @@ bool write_temperature(const std::string& filepath, double temperature) {
 }
 
 // ---------------------------------------------------------
-// 8) Main daemon entry
+// 9) Main: continuously read from ADS1115, compute temp, write to file
 // ---------------------------------------------------------
 int main(int argc, char* argv[]) {
+    // Handle Ctrl-C, kill signals
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    // 8a) Open and configure ADS1115
+    // 9a) Open & configure ADS1115
     const char* i2c_device = "/dev/i2c-1";
     int fd = initialize_i2c(i2c_device, ADS1115_ADDRESS);
     if (fd < 0) {
+        // Already printed an error
         return 1;
     }
     if (!configure_ads1115(fd)) {
@@ -173,42 +196,72 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 8b) Setup constants
+    // 9b) Setup known resistor & supply voltage
     const double R_PULLUP = 330.0; // ohms
     const double V_SUPPLY = 3.3;   // volts
 
-    // 8c) Output path for the temperature
-    const std::string output_file = "/data/local/tmp/oil_temp";
+    // 9c) Where to write our file
+    const std::string output_file = "/data/local/tmp/oil_temp.txt";
 
-    // 8d) Main loop
+    // 9d) Main loop
     while (!g_shouldStop) {
-        // Read ADC, convert to voltage
+        // 1) Read raw ADC
         int16_t raw_adc = read_ads1115(fd);
         double voltage = adc_to_voltage(raw_adc);
 
-        // Compute sensor R, then temperature
+        // 2) Convert to resistance
         double R_sensor = compute_sensor_resistance(voltage, R_PULLUP, V_SUPPLY);
-        double temp_f   = resistance_to_temp_f(R_sensor, vdo_table);
 
-        // Print/log
-        if (std::isnan(temp_f)) {
-            std::cout << "[daemon] Voltage=" << voltage
-                      << "  R=" << R_sensor 
-                      << " => out of range!\n";
-        } else {
+        // 3) Interpret R -> temperature
+        double temp_f = resistance_to_temp_f(R_sensor);
+
+        // 4) Logging / error handling
+        if (std::isinf(R_sensor)) {
+            // Probably sensor is open or not connected
             std::cout << "[daemon] Voltage=" << voltage 
-                      << "  R=" << R_sensor 
+                      << " => R=inf (sensor open?) => writing NaN\n";
+            temp_f = std::numeric_limits<double>::quiet_NaN();
+        } else if (R_sensor == 0.0) {
+            // Possibly shorted to ground or negative reading
+            std::cout << "[daemon] Voltage=" << voltage 
+                      << " => R=0 (short/negative?) => writing NaN\n";
+            temp_f = std::numeric_limits<double>::quiet_NaN();
+        } else if (std::isnan(temp_f)) {
+            // We ended up out of table range
+            if (R_sensor > vdo_table.front().second) {
+                // colder than minimum
+                std::cout << "[daemon] Voltage=" << voltage
+                          << "  R=" << R_sensor 
+                          << " => below table min => writing NaN\n";
+            } else if (R_sensor < vdo_table.back().second) {
+                // hotter than maximum
+                std::cout << "[daemon] Voltage=" << voltage
+                          << "  R=" << R_sensor
+                          << " => above table max => writing NaN\n";
+            } else {
+                // Some other weird case
+                std::cout << "[daemon] Voltage=" << voltage
+                          << "  R=" << R_sensor
+                          << " => can't interpolate => writing NaN\n";
+            }
+        } else {
+            // Normal case
+            std::cout << "[daemon] Voltage=" << voltage
+                      << "  R=" << R_sensor
                       << " => " << temp_f << " °F\n";
         }
 
-        // Write to file
+        // 5) Write the temperature (NaN or real value) to file
         if (!write_temperature(output_file, temp_f)) {
-            std::cerr << "[daemon] Error writing temperature\n";
+            std::cerr << "[daemon] Error writing temperature to " 
+                      << output_file << "\n";
         }
 
+        // Sleep 1 second
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
+    // Cleanup
     close(fd);
     std::cout << "[daemon] Exiting cleanly.\n";
     return 0;
